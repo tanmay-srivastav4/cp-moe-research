@@ -51,6 +51,11 @@ class TrainingConfig:
     epochs_per_task: int
     max_seq_length: int
     save_after_each_task: bool = True
+    eval_batch_size: int = 4
+    max_new_tokens: int = 64
+    train_max_samples: int | None = None
+    eval_max_samples: int | None = None
+    evaluate_seen_after_each_task: bool = True
 
 
 @dataclass
@@ -60,6 +65,9 @@ class DataConfig:
     order: list[str] | None = None
     zero_shot: list[str] | None = None
     data_dir: str | None = None
+    eval_fraction: float = 0.1
+    eval_max_samples: int | None = None
+    train_max_samples: int | None = None
 
 
 @dataclass
@@ -93,4 +101,3 @@ def asdict_shallow(config: Config) -> dict[str, Any]:
         "training": vars(config.training),
         "data": vars(config.data),
     }
-

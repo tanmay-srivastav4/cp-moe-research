@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from cpmoe.benchmark import build_summary, evaluate_task_generation
 from cpmoe.config import asdict_shallow, load_config
 from cpmoe.data import iter_token_budget, load_tasks
 from cpmoe.modeling import moe_auxiliary_loss, replace_target_linears
@@ -43,6 +44,7 @@ def main() -> None:
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path,
@@ -65,6 +67,9 @@ def main() -> None:
     model.to(device)
 
     tasks = load_tasks(config.data)
+    all_eval_tasks = load_tasks(config.data, include_zero_shot=True)
+    zero_shot_tasks = {task.name: task for task in all_eval_tasks if task.name in (config.data.zero_shot or [])}
+    train_task_names = [task.name for task in tasks]
     importance = zero_importance(layers)
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -72,6 +77,7 @@ def main() -> None:
     )
 
     metrics = []
+    score_matrix: list[dict[str, float]] = []
     for task_index, task in enumerate(tasks, start=1):
         print(f"\n=== Task {task_index}/{len(tasks)}: {task.name} ===")
         old_experts = snapshot_experts(layers)
@@ -101,7 +107,7 @@ def main() -> None:
             f"mean_importance={probe_stats.mean_importance:.4f}"
         )
 
-        dataset = EncodedRows(task.train, tokenizer, config.training.max_seq_length)
+        dataset = EncodedRows(_maybe_limit(task.train, config.training.train_max_samples), tokenizer, config.training.max_seq_length)
         loader = DataLoader(
             dataset,
             batch_size=config.training.batch_size,
@@ -131,6 +137,23 @@ def main() -> None:
                     reg=f"{reg_loss.item():.4f}",
                 )
 
+        seen_scores = {}
+        if config.training.evaluate_seen_after_each_task:
+            for eval_task in tasks[:task_index]:
+                task_score = evaluate_task_generation(
+                    model,
+                    tokenizer,
+                    eval_task,
+                    max_seq_length=config.training.max_seq_length,
+                    max_new_tokens=config.training.max_new_tokens,
+                    batch_size=config.training.eval_batch_size,
+                    device=device,
+                    max_samples=config.training.eval_max_samples,
+                )
+                seen_scores[eval_task.name] = task_score.score
+                print(f"eval {eval_task.name} {task_score.metric}={task_score.score:.2f}")
+        score_matrix.append(seen_scores)
+
         task_metrics = evaluate_loss(model, task.eval, tokenizer, config.training.max_seq_length, device)
         metrics.append(
             {
@@ -139,13 +162,35 @@ def main() -> None:
                 "probe_mean_cka": probe_stats.mean_cka,
                 "probe_mean_importance": probe_stats.mean_importance,
                 **task_metrics,
+                "seen_scores": seen_scores,
             }
         )
         (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        (output_dir / "score_matrix.json").write_text(json.dumps(score_matrix, indent=2), encoding="utf-8")
 
         if config.training.save_after_each_task:
             task_dir = ensure_dir(output_dir / f"task_{task_index:02d}_{task.name}")
             torch.save({"model": model.state_dict()}, task_dir / "checkpoint.pt")
+
+    zero_shot_scores = {}
+    for task_name, eval_task in zero_shot_tasks.items():
+        task_score = evaluate_task_generation(
+            model,
+            tokenizer,
+            eval_task,
+            max_seq_length=config.training.max_seq_length,
+            max_new_tokens=config.training.max_new_tokens,
+            batch_size=config.training.eval_batch_size,
+            device=device,
+            max_samples=config.training.eval_max_samples,
+        )
+        zero_shot_scores[task_name] = task_score.score
+        print(f"zero-shot {task_name} {task_score.metric}={task_score.score:.2f}")
+
+    summary = build_summary(train_task_names, score_matrix, zero_shot_scores)
+    (output_dir / "benchmark_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print("\nBenchmark summary")
+    print(json.dumps(summary, indent=2))
 
 
 class EncodedRows(torch.utils.data.Dataset):
@@ -197,6 +242,12 @@ def evaluate_loss(model, rows, tokenizer, max_length: int, device: torch.device)
         losses.append(float(model(**batch).loss.detach().cpu()))
     model.train()
     return {"eval_loss": sum(losses) / max(len(losses), 1)}
+
+
+def _maybe_limit(rows: list[dict[str, str]], limit: int | None) -> list[dict[str, str]]:
+    if limit is None:
+        return rows
+    return rows[:limit]
 
 
 if __name__ == "__main__":

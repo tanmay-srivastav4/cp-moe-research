@@ -40,6 +40,11 @@ training:
   epochs_per_task: 5
   max_seq_length: 512
   save_after_each_task: true
+  eval_batch_size: 4
+  max_new_tokens: 64
+  train_max_samples: null
+  eval_max_samples: 200
+  evaluate_seen_after_each_task: true
 
 data:
   mode: superni
@@ -61,4 +66,7 @@ data:
     - task1687
     - task875
   data_dir: data/raw/superni
+  eval_fraction: 0.1
+  train_max_samples: null
+  eval_max_samples: 200
 
