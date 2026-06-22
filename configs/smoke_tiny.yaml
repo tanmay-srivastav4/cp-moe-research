@@ -1,0 +1,54 @@
+experiment:
+  name: smoke_tiny_cpmoe
+  output_dir: outputs/smoke_tiny
+  seed: 7
+
+model:
+  name_or_path: sshleifer/tiny-gpt2
+  torch_dtype: float32
+  load_in_4bit: false
+  trust_remote_code: false
+
+cp_moe:
+  num_experts: 4
+  top_k: 2
+  rank: 2
+  lora_alpha: 8
+  lora_dropout: 0.0
+  target_modules:
+    - c_attn
+    - c_proj
+  cp_bias_alpha: 0.2
+  reg_lambda: 5000.0
+  aux_gamma: 0.1
+  damping_xi: 1.0e-6
+
+transient:
+  warmup_tokens: 512
+  max_steps: 5
+  lr: 2.0e-4
+
+training:
+  lr: 2.0e-4
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  epochs_per_task: 1
+  max_seq_length: 128
+  save_after_each_task: true
+
+data:
+  mode: toy
+  tasks:
+    - name: sentiment
+      train:
+        - input: "Review: I loved this movie. Sentiment:"
+          output: " positive"
+        - input: "Review: This was awful. Sentiment:"
+          output: " negative"
+    - name: qa
+      train:
+        - input: "Question: What color is the sky? Answer:"
+          output: " blue"
+        - input: "Question: How many days are in a week? Answer:"
+          output: " seven"
+

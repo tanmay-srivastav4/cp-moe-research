@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cp-moe-research"
+version = "0.1.0"
+description = "CP-MoE reproduction and router-aware continual learning experiments"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.30",
+  "datasets>=2.19",
+  "evaluate>=0.4",
+  "numpy>=1.26",
+  "peft>=0.11",
+  "pyyaml>=6.0",
+  "rouge-score>=0.1.2",
+  "sentencepiece>=0.2",
+  "torch>=2.3",
+  "tqdm>=4.66",
+  "transformers>=4.41",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
