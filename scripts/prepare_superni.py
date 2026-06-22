@@ -40,15 +40,10 @@ def main() -> None:
 
 
 def _find_task_file(root: Path, task_name: str) -> Path | None:
-    candidates = [
-        root / f"{task_name}.json",
-        root / "tasks" / f"{task_name}.json",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    matches = list(root.rglob(f"{task_name}.json"))
-    return matches[0] if matches else None
+    for file in root.rglob("*.json"):
+        if file.name.startswith(task_name):
+            return file
+    return None
 
 
 if __name__ == "__main__":
