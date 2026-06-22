@@ -73,18 +73,15 @@ class MoELoraLinear(nn.Module):
         return self.transient_a is not None and self.transient_b is not None
 
     def start_transient_probe(self) -> None:
-        """
-        Create transient probe weights on the same device as the
-        currently active module parameters.
-        """
-        device = next(self.parameters()).device
+        device = self.lora_a.device
+        dtype = self.lora_a.dtype
 
         transient_a = nn.Parameter(
             torch.zeros(
                 self.rank,
                 self.in_features,
                 device=device,
-                dtype=self.lora_a.dtype,
+                dtype=dtype,
             )
         )
 
@@ -93,7 +90,7 @@ class MoELoraLinear(nn.Module):
                 self.out_features,
                 self.rank,
                 device=device,
-                dtype=self.lora_b.dtype,
+                dtype=dtype,
             )
         )
 
@@ -150,15 +147,15 @@ class MoELoraLinear(nn.Module):
         if not self.transient_active:
             raise RuntimeError("Transient probe is not active")
 
-        # Safety for Accelerate / device-mapped models
-        transient_a = self.transient_a
-        transient_b = self.transient_b
+        transient_a = self.transient_a.to(
+            device=flat_x.device,
+            dtype=flat_x.dtype,
+        )
 
-        if transient_a.device != flat_x.device:
-            transient_a = transient_a.to(flat_x.device)
-
-        if transient_b.device != flat_x.device:
-            transient_b = transient_b.to(flat_x.device)
+        transient_b = self.transient_b.to(
+            device=flat_x.device,
+            dtype=flat_x.dtype,
+        )
 
         hidden = torch.matmul(flat_x, transient_a.t())
         return torch.matmul(hidden, transient_b.t()) * self.scaling
