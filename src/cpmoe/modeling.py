@@ -73,10 +73,33 @@ class MoELoraLinear(nn.Module):
         return self.transient_a is not None and self.transient_b is not None
 
     def start_transient_probe(self) -> None:
-        transient_a = nn.Parameter(torch.zeros(self.rank, self.in_features, device=self.lora_a.device))
-        transient_b = nn.Parameter(torch.zeros(self.out_features, self.rank, device=self.lora_b.device))
+        """
+        Create transient probe weights on the same device as the
+        currently active module parameters.
+        """
+        device = next(self.parameters()).device
+
+        transient_a = nn.Parameter(
+            torch.zeros(
+                self.rank,
+                self.in_features,
+                device=device,
+                dtype=self.lora_a.dtype,
+            )
+        )
+
+        transient_b = nn.Parameter(
+            torch.zeros(
+                self.out_features,
+                self.rank,
+                device=device,
+                dtype=self.lora_b.dtype,
+            )
+        )
+
         nn.init.kaiming_uniform_(transient_a, a=5**0.5)
         nn.init.zeros_(transient_b)
+
         self.transient_a = transient_a
         self.transient_b = transient_b
 
@@ -126,8 +149,19 @@ class MoELoraLinear(nn.Module):
     def transient_output(self, flat_x: torch.Tensor) -> torch.Tensor:
         if not self.transient_active:
             raise RuntimeError("Transient probe is not active")
-        hidden = torch.matmul(flat_x, self.transient_a.t())
-        return torch.matmul(hidden, self.transient_b.t()) * self.scaling
+
+        # Safety for Accelerate / device-mapped models
+        transient_a = self.transient_a
+        transient_b = self.transient_b
+
+        if transient_a.device != flat_x.device:
+            transient_a = transient_a.to(flat_x.device)
+
+        if transient_b.device != flat_x.device:
+            transient_b = transient_b.to(flat_x.device)
+
+        hidden = torch.matmul(flat_x, transient_a.t())
+        return torch.matmul(hidden, transient_b.t()) * self.scaling
 
     def start_input_capture(self, max_tokens: int) -> None:
         self._capture_inputs = True
