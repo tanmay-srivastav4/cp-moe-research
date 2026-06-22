@@ -6,7 +6,7 @@ import json
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from cpmoe.benchmark import build_summary, evaluate_task_generation
 from cpmoe.config import asdict_shallow, load_config
@@ -46,14 +46,28 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model.name_or_path,
-        torch_dtype=resolve_dtype(config.model.torch_dtype),
-        trust_remote_code=config.model.trust_remote_code,
-    )
+    if config.model.load_in_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=resolve_dtype(config.model.torch_dtype),
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model.name_or_path,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=config.model.trust_remote_code,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model.name_or_path,
+            torch_dtype=resolve_dtype(config.model.torch_dtype),
+            trust_remote_code=config.model.trust_remote_code,
+        )
+        model.to(device)
     for param in model.parameters():
         param.requires_grad = False
-    model.to(device)
 
     layers = replace_target_linears(
         model,
@@ -64,7 +78,9 @@ def main() -> None:
         lora_alpha=config.cp_moe.lora_alpha,
         lora_dropout=config.cp_moe.lora_dropout,
     )
-    model.to(device)
+    # Skip model.to(device) when load_in_4bit=True — device_map='auto' already placed layers.
+    if not config.model.load_in_4bit:
+        model.to(device)
 
     tasks = load_tasks(config.data)
     all_eval_tasks = load_tasks(config.data, include_zero_shot=True)

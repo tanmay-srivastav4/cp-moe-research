@@ -152,8 +152,12 @@ class MoELoraLinear(nn.Module):
         self._captured_inputs.append(flat_x[:remaining].detach())
 
     def _record_router_metrics(self, logits: torch.Tensor, top_indices: torch.Tensor) -> None:
+        # Eq. 12: both f_i (load) and P_i (prob_mean) must use native logits only.
+        # top_indices here comes from biased logits (used for actual routing), so we
+        # recompute native top-k to get the correct f_i for the aux loss.
         probs = F.softmax(logits, dim=-1)
-        load = F.one_hot(top_indices, num_classes=self.num_experts).float().mean(dim=(0, 1))
+        native_top = torch.topk(logits, k=self.top_k, dim=-1).indices
+        load = F.one_hot(native_top, num_classes=self.num_experts).float().mean(dim=(0, 1))
         prob_mean = probs.mean(dim=0)
         self.last_aux_loss = self.num_experts * torch.sum(load * prob_mean)
         self.last_router_entropy = -(prob_mean * (prob_mean + 1e-8).log()).sum()

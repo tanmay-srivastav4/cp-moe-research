@@ -34,7 +34,12 @@ training:
   gradient_accumulation_steps: 1
   epochs_per_task: 1
   max_seq_length: 128
-  save_after_each_task: true
+  save_after_each_task: false
+  evaluate_seen_after_each_task: true
+  eval_batch_size: 2
+  max_new_tokens: 16
+  train_max_samples: null
+  eval_max_samples: null
 
 data:
   mode: toy
@@ -51,4 +56,3 @@ data:
           output: " blue"
         - input: "Question: How many days are in a week? Answer:"
           output: " seven"
-
