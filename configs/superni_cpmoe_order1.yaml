@@ -59,11 +59,11 @@ data:
     - task1729
   zero_shot:
     - task073
+    - task084
     - task1590
     - task748
     - task511
     - task591
-    - task1687
     - task875
   data_dir: data/raw/superni
   eval_fraction: 0.1

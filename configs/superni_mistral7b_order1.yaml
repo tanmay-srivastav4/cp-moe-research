@@ -62,13 +62,13 @@ data:
     - task1729
   zero_shot:
     - task073
+    - task084
     - task1590
     - task748
     - task511
     - task591
-    - task1687
     - task875
-  data_dir: /kaggle/working/natural-instructions/tasks
+  data_dir: data/raw/superni
   eval_fraction: 0.1
   train_max_samples: null
   eval_max_samples: 200

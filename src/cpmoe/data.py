@@ -23,7 +23,7 @@ SUPERNI_TASKS = {
     "task748": {"dataset": "glucose_reverse_cause_event_detection", "type": "info_extraction", "metric": "rouge_l"},
     "task511": {"dataset": "reddit_tifu_long_text_summarization", "type": "question_answering", "metric": "rouge_l"},
     "task591": {"dataset": "sciq_answer_generation", "type": "dialogue_generation", "metric": "rouge_l"},
-    "task1687": {"dataset": "sentiment140_classification", "type": "sentiment", "metric": "accuracy"},
+    "task084": {"dataset": "sentiment140_classification", "type": "sentiment", "metric": "accuracy"},
     "task875": {"dataset": "emotion_classification", "type": "sentiment", "metric": "accuracy"},
 }
 
