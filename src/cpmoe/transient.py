@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Iterable
+
 import torch
+from torch import nn
 
 from .modeling import MoELoraLinear
+
+
+@dataclass
+class ProbeStats:
+    warmup_steps: int
+    mean_cka: float
+    mean_importance: float
 
 
 @torch.no_grad()
@@ -55,18 +66,283 @@ def zero_importance(layers: list[MoELoraLinear]) -> list[dict[str, torch.Tensor]
     ]
 
 
-@torch.no_grad()
-def accumulate_dummy_importance(
+def run_transient_probe(
+    model: nn.Module,
     layers: list[MoELoraLinear],
-    current: list[dict[str, torch.Tensor]],
-    scale: float = 1.0,
-) -> None:
-    """Temporary stand-in until full transient probe trajectory code is wired.
+    warmup_loader: Iterable[dict[str, torch.Tensor]],
+    importance: list[dict[str, torch.Tensor]],
+    *,
+    max_steps: int,
+    lr: float,
+    damping_xi: float,
+    cp_bias_alpha: float,
+    device: torch.device,
+    cka_tokens_per_layer: int = 256,
+) -> ProbeStats:
+    """Run CP-MoE transient probing before main task training.
 
-    This lets us validate the regularized continual training loop before adding
-    the expensive transient expert path-integral implementation.
+    The transient branch is a single LoRA adapter per wrapped layer. It is trained
+    briefly on warm-up data, converted into path-integral importance weights, then
+    discarded. Stable experts receive CKA-weighted importance, and their routers
+    receive CKA-derived CP bias.
     """
-    for layer, omega in zip(layers, current, strict=True):
-        omega["a"].add_(torch.ones_like(layer.lora_a) * scale)
-        omega["b"].add_(torch.ones_like(layer.lora_b) * scale)
+    if not layers:
+        raise ValueError("No MoE layers passed to run_transient_probe")
 
+    original_train_mode = model.training
+    requires_grad_state = {name: param.requires_grad for name, param in model.named_parameters()}
+    transient_initial: list[dict[str, torch.Tensor]] = []
+    path_work: list[dict[str, torch.Tensor]] = []
+
+    try:
+        _set_all_requires_grad(model, False)
+        for layer in layers:
+            layer.start_transient_probe()
+            for param in layer.transient_parameters():
+                param.requires_grad = True
+            transient_initial.append(
+                {
+                    "a": layer.transient_a.detach().clone(),
+                    "b": layer.transient_b.detach().clone(),
+                }
+            )
+            path_work.append(
+                {
+                    "a": torch.zeros_like(layer.transient_a),
+                    "b": torch.zeros_like(layer.transient_b),
+                }
+            )
+
+        optimizer = torch.optim.AdamW(_transient_parameters(layers), lr=lr)
+        warmup_steps = _run_warmup_steps(
+            model=model,
+            layers=layers,
+            warmup_loader=warmup_loader,
+            optimizer=optimizer,
+            path_work=path_work,
+            max_steps=max_steps,
+            device=device,
+        )
+
+        transient_importance = _normalise_importance(
+            layers=layers,
+            initial=transient_initial,
+            path_work=path_work,
+            damping_xi=damping_xi,
+        )
+        cka_scores = _estimate_cka_scores(
+            model=model,
+            layers=layers,
+            warmup_loader=warmup_loader,
+            device=device,
+            cka_tokens_per_layer=cka_tokens_per_layer,
+        )
+        _apply_probe_results(
+            layers=layers,
+            importance=importance,
+            transient_importance=transient_importance,
+            cka_scores=cka_scores,
+            cp_bias_alpha=cp_bias_alpha,
+        )
+        return ProbeStats(
+            warmup_steps=warmup_steps,
+            mean_cka=_mean_score(cka_scores),
+            mean_importance=_mean_importance(transient_importance),
+        )
+    finally:
+        for layer in layers:
+            layer.stop_transient_probe()
+        _restore_requires_grad(model, requires_grad_state)
+        model.train(original_train_mode)
+
+
+def _run_warmup_steps(
+    *,
+    model: nn.Module,
+    layers: list[MoELoraLinear],
+    warmup_loader: Iterable[dict[str, torch.Tensor]],
+    optimizer: torch.optim.Optimizer,
+    path_work: list[dict[str, torch.Tensor]],
+    max_steps: int,
+    device: torch.device,
+) -> int:
+    model.train()
+    steps = 0
+    for batch in warmup_loader:
+        if steps >= max_steps:
+            break
+        batch = {key: value.to(device) for key, value in batch.items()}
+        before = _snapshot_transient(layers)
+        out = model(**batch)
+        out.loss.backward()
+        grads = _snapshot_transient_grads(layers)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        _accumulate_path_work(layers, before, grads, path_work)
+        steps += 1
+    if steps == 0:
+        raise ValueError("Transient warm-up received no batches")
+    return steps
+
+
+@torch.no_grad()
+def _estimate_cka_scores(
+    *,
+    model: nn.Module,
+    layers: list[MoELoraLinear],
+    warmup_loader: Iterable[dict[str, torch.Tensor]],
+    device: torch.device,
+    cka_tokens_per_layer: int,
+) -> list[torch.Tensor]:
+    model.eval()
+    for layer in layers:
+        layer.start_input_capture(cka_tokens_per_layer)
+
+    batch = next(iter(warmup_loader), None)
+    if batch is None:
+        raise ValueError("Cannot estimate CKA without warm-up batches")
+    batch = {key: value.to(device) for key, value in batch.items()}
+    model(**batch)
+
+    all_scores = []
+    for layer in layers:
+        flat_x = layer.stop_input_capture()
+        if flat_x is None or flat_x.numel() == 0:
+            scores = torch.ones(layer.num_experts, device=device) / layer.num_experts
+        else:
+            scores = _layer_cka_scores(layer, flat_x.to(device))
+        all_scores.append(scores)
+    return all_scores
+
+
+@torch.no_grad()
+def _layer_cka_scores(layer: MoELoraLinear, flat_x: torch.Tensor) -> torch.Tensor:
+    transient_z = layer.transient_output(flat_x)
+    expert_z = layer.expert_outputs(flat_x)
+    scores = []
+    for expert_index in range(layer.num_experts):
+        scores.append(_linear_cka(transient_z, expert_z[:, expert_index, :]))
+    stacked = torch.stack(scores)
+    if torch.allclose(stacked.sum(), torch.zeros((), device=stacked.device)):
+        return torch.ones_like(stacked) / stacked.numel()
+    return stacked.clamp_min(0.0)
+
+
+@torch.no_grad()
+def _linear_cka(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    x = x.float()
+    y = y.float()
+    x = x - x.mean(dim=0, keepdim=True)
+    y = y - y.mean(dim=0, keepdim=True)
+    xy = torch.matmul(x.t(), y)
+    xx = torch.matmul(x.t(), x)
+    yy = torch.matmul(y.t(), y)
+    numerator = xy.pow(2).sum()
+    denominator = torch.linalg.matrix_norm(xx) * torch.linalg.matrix_norm(yy) + eps
+    return (numerator / denominator).clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def _normalise_importance(
+    *,
+    layers: list[MoELoraLinear],
+    initial: list[dict[str, torch.Tensor]],
+    path_work: list[dict[str, torch.Tensor]],
+    damping_xi: float,
+) -> list[dict[str, torch.Tensor]]:
+    normalised = []
+    for layer, start, work in zip(layers, initial, path_work, strict=True):
+        delta_a = layer.transient_a - start["a"]
+        delta_b = layer.transient_b - start["b"]
+        omega_a = (work["a"] / (delta_a.pow(2) + damping_xi)).clamp_min(0.0)
+        omega_b = (work["b"] / (delta_b.pow(2) + damping_xi)).clamp_min(0.0)
+        normalised.append({"a": omega_a.detach().clone(), "b": omega_b.detach().clone()})
+    return normalised
+
+
+@torch.no_grad()
+def _apply_probe_results(
+    *,
+    layers: list[MoELoraLinear],
+    importance: list[dict[str, torch.Tensor]],
+    transient_importance: list[dict[str, torch.Tensor]],
+    cka_scores: list[torch.Tensor],
+    cp_bias_alpha: float,
+) -> None:
+    for layer, total, omega, scores in zip(
+        layers, importance, transient_importance, cka_scores, strict=True
+    ):
+        layer.set_cp_bias(scores, cp_bias_alpha)
+        scores = scores.to(total["a"].device, total["a"].dtype)
+        total["a"].add_(scores.view(-1, 1, 1) * omega["a"].unsqueeze(0))
+        total["b"].add_(scores.view(-1, 1, 1) * omega["b"].unsqueeze(0))
+
+
+@torch.no_grad()
+def _snapshot_transient(layers: list[MoELoraLinear]) -> list[dict[str, torch.Tensor]]:
+    return [
+        {
+            "a": layer.transient_a.detach().clone(),
+            "b": layer.transient_b.detach().clone(),
+        }
+        for layer in layers
+    ]
+
+
+@torch.no_grad()
+def _snapshot_transient_grads(layers: list[MoELoraLinear]) -> list[dict[str, torch.Tensor]]:
+    snapshots = []
+    for layer in layers:
+        snapshots.append(
+            {
+                "a": layer.transient_a.grad.detach().clone(),
+                "b": layer.transient_b.grad.detach().clone(),
+            }
+        )
+    return snapshots
+
+
+@torch.no_grad()
+def _accumulate_path_work(
+    layers: list[MoELoraLinear],
+    before: list[dict[str, torch.Tensor]],
+    grads: list[dict[str, torch.Tensor]],
+    path_work: list[dict[str, torch.Tensor]],
+) -> None:
+    for layer, old, grad, work in zip(layers, before, grads, path_work, strict=True):
+        work["a"].add_(-grad["a"] * (layer.transient_a - old["a"]))
+        work["b"].add_(-grad["b"] * (layer.transient_b - old["b"]))
+
+
+def _transient_parameters(layers: list[MoELoraLinear]) -> list[nn.Parameter]:
+    params: list[nn.Parameter] = []
+    for layer in layers:
+        params.extend(layer.transient_parameters())
+    return params
+
+
+def _set_all_requires_grad(model: nn.Module, value: bool) -> None:
+    for param in model.parameters():
+        param.requires_grad = value
+
+
+def _restore_requires_grad(model: nn.Module, state: dict[str, bool]) -> None:
+    for name, param in model.named_parameters():
+        if name in state:
+            param.requires_grad = state[name]
+
+
+def _mean_score(scores: list[torch.Tensor]) -> float:
+    if not scores:
+        return 0.0
+    return float(torch.stack([score.detach().float().mean().cpu() for score in scores]).mean())
+
+
+def _mean_importance(importance: list[dict[str, torch.Tensor]]) -> float:
+    if not importance:
+        return 0.0
+    values = []
+    for item in importance:
+        values.append(item["a"].detach().float().mean().cpu())
+        values.append(item["b"].detach().float().mean().cpu())
+    return float(torch.stack(values).mean())

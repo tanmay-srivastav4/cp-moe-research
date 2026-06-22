@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
@@ -10,12 +9,12 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cpmoe.config import asdict_shallow, load_config
-from cpmoe.data import load_tasks
+from cpmoe.data import iter_token_budget, load_tasks
 from cpmoe.modeling import moe_auxiliary_loss, replace_target_linears
 from cpmoe.train_utils import ensure_dir, resolve_dtype, set_seed
 from cpmoe.transient import (
-    accumulate_dummy_importance,
     expert_regularization,
+    run_transient_probe,
     snapshot_experts,
     zero_importance,
 )
@@ -50,6 +49,8 @@ def main() -> None:
         torch_dtype=resolve_dtype(config.model.torch_dtype),
         trust_remote_code=config.model.trust_remote_code,
     )
+    for param in model.parameters():
+        param.requires_grad = False
     model.to(device)
 
     layers = replace_target_linears(
@@ -74,7 +75,31 @@ def main() -> None:
     for task_index, task in enumerate(tasks, start=1):
         print(f"\n=== Task {task_index}/{len(tasks)}: {task.name} ===")
         old_experts = snapshot_experts(layers)
-        accumulate_dummy_importance(layers, importance, scale=0.0 if task_index == 1 else 1e-5)
+        warmup_rows = iter_token_budget(task.train, tokenizer, config.transient.warmup_tokens)
+        warmup_dataset = EncodedRows(warmup_rows, tokenizer, config.training.max_seq_length)
+        warmup_loader = DataLoader(
+            warmup_dataset,
+            batch_size=config.training.batch_size,
+            shuffle=True,
+            collate_fn=warmup_dataset.collate,
+        )
+        probe_stats = run_transient_probe(
+            model=model,
+            layers=layers,
+            warmup_loader=warmup_loader,
+            importance=importance,
+            max_steps=config.transient.max_steps,
+            lr=config.transient.lr,
+            damping_xi=config.cp_moe.damping_xi,
+            cp_bias_alpha=config.cp_moe.cp_bias_alpha,
+            device=device,
+        )
+        print(
+            "probe "
+            f"steps={probe_stats.warmup_steps} "
+            f"mean_cka={probe_stats.mean_cka:.4f} "
+            f"mean_importance={probe_stats.mean_importance:.4f}"
+        )
 
         dataset = EncodedRows(task.train, tokenizer, config.training.max_seq_length)
         loader = DataLoader(
@@ -107,7 +132,15 @@ def main() -> None:
                 )
 
         task_metrics = evaluate_loss(model, task.eval, tokenizer, config.training.max_seq_length, device)
-        metrics.append({"task": task.name, **task_metrics})
+        metrics.append(
+            {
+                "task": task.name,
+                "probe_steps": probe_stats.warmup_steps,
+                "probe_mean_cka": probe_stats.mean_cka,
+                "probe_mean_importance": probe_stats.mean_importance,
+                **task_metrics,
+            }
+        )
         (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
         if config.training.save_after_each_task:
@@ -168,4 +201,3 @@ def evaluate_loss(model, rows, tokenizer, max_length: int, device: torch.device)
 
 if __name__ == "__main__":
     main()
-

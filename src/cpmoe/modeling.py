@@ -40,10 +40,14 @@ class MoELoraLinear(nn.Module):
             param.requires_grad = False
 
         in_features, out_features = self._feature_dims(base)
+        self.in_features = in_features
+        self.out_features = out_features
         self.lora_a = nn.Parameter(torch.zeros(num_experts, rank, in_features))
         self.lora_b = nn.Parameter(torch.zeros(num_experts, out_features, rank))
         self.router = nn.Linear(in_features, num_experts, bias=False)
         self.cp_bias = nn.Parameter(torch.zeros(num_experts), requires_grad=False)
+        self.register_parameter("transient_a", None)
+        self.register_parameter("transient_b", None)
 
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
         nn.init.zeros_(self.lora_b)
@@ -51,6 +55,9 @@ class MoELoraLinear(nn.Module):
 
         self.last_aux_loss: torch.Tensor | None = None
         self.last_router_entropy: torch.Tensor | None = None
+        self._capture_inputs = False
+        self._capture_max_tokens = 0
+        self._captured_inputs: list[torch.Tensor] = []
 
     @staticmethod
     def _feature_dims(base: nn.Module) -> tuple[int, int]:
@@ -61,19 +68,46 @@ class MoELoraLinear(nn.Module):
             return int(base.weight.shape[0]), int(base.weight.shape[1])
         raise TypeError(f"Unsupported base module for MoE-LoRA: {type(base).__name__}")
 
+    @property
+    def transient_active(self) -> bool:
+        return self.transient_a is not None and self.transient_b is not None
+
+    def start_transient_probe(self) -> None:
+        transient_a = nn.Parameter(torch.zeros(self.rank, self.in_features, device=self.lora_a.device))
+        transient_b = nn.Parameter(torch.zeros(self.out_features, self.rank, device=self.lora_b.device))
+        nn.init.kaiming_uniform_(transient_a, a=5**0.5)
+        nn.init.zeros_(transient_b)
+        self.transient_a = transient_a
+        self.transient_b = transient_b
+
+    def stop_transient_probe(self) -> None:
+        self.register_parameter("transient_a", None)
+        self.register_parameter("transient_b", None)
+
+    def transient_parameters(self) -> list[nn.Parameter]:
+        if not self.transient_active:
+            return []
+        return [self.transient_a, self.transient_b]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
         original_shape = x.shape
         flat_x = x.reshape(-1, original_shape[-1])
-        dropped = self.dropout(flat_x)
+        self._maybe_capture_input(flat_x)
 
+        if self.transient_active:
+            mixed = self.transient_output(flat_x).reshape(*original_shape[:-1], -1)
+            self.last_aux_loss = None
+            self.last_router_entropy = None
+            return base_out + mixed
+
+        dropped = self.dropout(flat_x)
         logits = self.router(flat_x)
         biased_logits = logits + self.cp_bias.to(logits.dtype)
         top_values, top_indices = torch.topk(biased_logits, k=self.top_k, dim=-1)
         top_weights = F.softmax(top_values, dim=-1)
 
-        expert_hidden = torch.einsum("bi,eri->ber", dropped, self.lora_a)
-        expert_out = torch.einsum("ber,eor->beo", expert_hidden, self.lora_b) * self.scaling
+        expert_out = self.expert_outputs(dropped)
         chosen = torch.gather(
             expert_out,
             1,
@@ -84,6 +118,38 @@ class MoELoraLinear(nn.Module):
 
         self._record_router_metrics(logits, top_indices)
         return base_out + mixed
+
+    def expert_outputs(self, flat_x: torch.Tensor) -> torch.Tensor:
+        expert_hidden = torch.einsum("bi,eri->ber", flat_x, self.lora_a)
+        return torch.einsum("ber,eor->beo", expert_hidden, self.lora_b) * self.scaling
+
+    def transient_output(self, flat_x: torch.Tensor) -> torch.Tensor:
+        if not self.transient_active:
+            raise RuntimeError("Transient probe is not active")
+        hidden = torch.matmul(flat_x, self.transient_a.t())
+        return torch.matmul(hidden, self.transient_b.t()) * self.scaling
+
+    def start_input_capture(self, max_tokens: int) -> None:
+        self._capture_inputs = True
+        self._capture_max_tokens = max_tokens
+        self._captured_inputs = []
+
+    def stop_input_capture(self) -> torch.Tensor | None:
+        self._capture_inputs = False
+        if not self._captured_inputs:
+            return None
+        captured = torch.cat(self._captured_inputs, dim=0)
+        self._captured_inputs = []
+        return captured
+
+    def _maybe_capture_input(self, flat_x: torch.Tensor) -> None:
+        if not self._capture_inputs:
+            return
+        already = sum(tensor.shape[0] for tensor in self._captured_inputs)
+        remaining = self._capture_max_tokens - already
+        if remaining <= 0:
+            return
+        self._captured_inputs.append(flat_x[:remaining].detach())
 
     def _record_router_metrics(self, logits: torch.Tensor, top_indices: torch.Tensor) -> None:
         probs = F.softmax(logits, dim=-1)
@@ -154,5 +220,3 @@ def moe_auxiliary_loss(model: nn.Module, device: torch.device) -> torch.Tensor:
     if not losses:
         return torch.zeros((), device=device)
     return torch.stack(losses).mean()
-
-
