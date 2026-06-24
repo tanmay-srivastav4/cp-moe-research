@@ -1,0 +1,71 @@
+experiment:
+  name: superni_llama2_7b_kaggle_order1
+  output_dir: outputs/superni_llama2_7b_kaggle_order1
+  seed: 7
+
+model:
+  name_or_path: meta-llama/Llama-2-7b-hf
+  torch_dtype: float16
+  load_in_4bit: true
+  trust_remote_code: false
+
+cp_moe:
+  num_experts: 8
+  top_k: 2
+  rank: 4
+  lora_alpha: 32
+  lora_dropout: 0.1
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  cp_bias_alpha: 0.2
+  reg_lambda: 5000.0
+  aux_gamma: 0.1
+  damping_xi: 1.0e-6
+
+transient:
+  warmup_tokens: 10000
+  max_steps: 100
+  lr: 2.0e-4
+
+training:
+  lr: 2.0e-4
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  epochs_per_task: 5
+  max_seq_length: 512
+  save_after_each_task: false
+  evaluate_seen_after_each_task: true
+  eval_batch_size: 1
+  max_new_tokens: 64
+  train_max_samples: null
+  eval_max_samples: 200
+
+data:
+  mode: superni
+  order:
+    - task1572
+    - task363
+    - task1290
+    - task181
+    - task002
+    - task1510
+    - task639
+    - task1729
+  zero_shot:
+    - task073
+    - task1590
+    - task748
+    - task511
+    - task591
+    - task084
+    - task875
+  data_dir: data/raw/superni
+  eval_fraction: 0.1
+  train_max_samples: null
+  eval_max_samples: 200

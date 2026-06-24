@@ -78,7 +78,7 @@ def main() -> None:
         lora_alpha=config.cp_moe.lora_alpha,
         lora_dropout=config.cp_moe.lora_dropout,
     )
-    # Skip model.to(device) when load_in_4bit=True — device_map='auto' already placed layers.
+    # Skip model.to(device) when load_in_4bit=True; device_map='auto' already placed layers.
     if not config.model.load_in_4bit:
         model.to(device)
 
@@ -131,9 +131,11 @@ def main() -> None:
             collate_fn=dataset.collate,
         )
 
+        accumulation_steps = max(1, config.training.gradient_accumulation_steps)
+        optimizer.zero_grad(set_to_none=True)
         for epoch in range(config.training.epochs_per_task):
             progress = tqdm(loader, desc=f"{task.name} epoch {epoch + 1}")
-            for batch in progress:
+            for step, batch in enumerate(progress, start=1):
                 batch = {key: value.to(device) for key, value in batch.items()}
                 out = model(**batch)
                 task_loss = out.loss
@@ -144,9 +146,10 @@ def main() -> None:
                     + config.cp_moe.aux_gamma * aux_loss
                     + config.cp_moe.reg_lambda * reg_loss
                 )
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                (loss / accumulation_steps).backward()
+                if step % accumulation_steps == 0 or step == len(loader):
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
                 progress.set_postfix(
                     task=f"{task_loss.item():.4f}",
                     aux=f"{aux_loss.item():.4f}",
@@ -186,7 +189,7 @@ def main() -> None:
 
         if config.training.save_after_each_task:
             task_dir = ensure_dir(output_dir / f"task_{task_index:02d}_{task.name}")
-            torch.save({"model": model.state_dict()}, task_dir / "checkpoint.pt")
+            torch.save({"moe": _moe_state_dict(layers)}, task_dir / "moe_checkpoint.pt")
 
     zero_shot_scores = {}
     for task_name, eval_task in zero_shot_tasks.items():
@@ -264,6 +267,16 @@ def _maybe_limit(rows: list[dict[str, str]], limit: int | None) -> list[dict[str
     if limit is None:
         return rows
     return rows[:limit]
+
+
+def _moe_state_dict(layers):
+    state = {}
+    for index, layer in enumerate(layers):
+        state[f"{index}.lora_a"] = layer.lora_a.detach().cpu()
+        state[f"{index}.lora_b"] = layer.lora_b.detach().cpu()
+        state[f"{index}.router.weight"] = layer.router.weight.detach().cpu()
+        state[f"{index}.cp_bias"] = layer.cp_bias.detach().cpu()
+    return state
 
 
 if __name__ == "__main__":

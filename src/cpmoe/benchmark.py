@@ -93,9 +93,9 @@ def evaluate_task_generation(
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-        prompt_lengths = attention_mask.sum(dim=1).tolist()
-        for output_ids, prompt_len in zip(generated, prompt_lengths, strict=True):
-            new_tokens = output_ids[int(prompt_len) :]
+        prompt_width = input_ids.shape[1]
+        for output_ids in generated:
+            new_tokens = output_ids[prompt_width:]
             predictions.append(tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
         targets.extend(batch["targets"])
 

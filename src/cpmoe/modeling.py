@@ -140,8 +140,10 @@ class MoELoraLinear(nn.Module):
         return base_out + mixed
 
     def expert_outputs(self, flat_x: torch.Tensor) -> torch.Tensor:
-        expert_hidden = torch.einsum("bi,eri->ber", flat_x, self.lora_a)
-        return torch.einsum("ber,eor->beo", expert_hidden, self.lora_b) * self.scaling
+        lora_a = self.lora_a.to(device=flat_x.device, dtype=flat_x.dtype)
+        lora_b = self.lora_b.to(device=flat_x.device, dtype=flat_x.dtype)
+        expert_hidden = torch.einsum("bi,eri->ber", flat_x, lora_a)
+        return torch.einsum("ber,eor->beo", expert_hidden, lora_b) * self.scaling
 
     def transient_output(self, flat_x: torch.Tensor) -> torch.Tensor:
         if not self.transient_active:
@@ -233,7 +235,10 @@ def replace_target_linears(
 
 
 def _is_supported_linear(module: nn.Module) -> bool:
-    return isinstance(module, nn.Linear) or bool(Conv1D and isinstance(module, Conv1D))
+    if isinstance(module, nn.Linear) or bool(Conv1D and isinstance(module, Conv1D)):
+        return True
+    # bitsandbytes quantized linear modules expose the same feature attributes.
+    return hasattr(module, "in_features") and hasattr(module, "out_features")
 
 
 def _iter_named_children_with_parent(module: nn.Module):
