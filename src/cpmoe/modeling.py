@@ -113,6 +113,13 @@ class MoELoraLinear(nn.Module):
         base_out = self.base(x)
         original_shape = x.shape
         flat_x = x.reshape(-1, original_shape[-1])
+        print(
+            "flat_x:", flat_x.device,
+            "router:", self.router.weight.device,
+            "lora_a:", self.lora_a.device,
+            "lora_b:", self.lora_b.device,
+            "cp_bias:", self.cp_bias.device,
+        )
         self._maybe_capture_input(flat_x)
 
         if self.transient_active:
@@ -121,9 +128,30 @@ class MoELoraLinear(nn.Module):
             self.last_router_entropy = None
             return base_out + mixed
 
+        # Ensure all CP-MoE tensors are on the same device/dtype
+        device = flat_x.device
+        dtype = flat_x.dtype
+
+        if self.router.weight.device != device:
+            self.router = self.router.to(device=device, dtype=dtype)
+
+        if self.lora_a.device != device:
+            self.lora_a.data = self.lora_a.data.to(device=device, dtype=dtype)
+
+        if self.lora_b.device != device:
+            self.lora_b.data = self.lora_b.data.to(device=device, dtype=dtype)
+
+        if self.cp_bias.device != device:
+            self.cp_bias.data = self.cp_bias.data.to(device=device, dtype=dtype)
+
         dropped = self.dropout(flat_x)
+
         logits = self.router(flat_x)
-        biased_logits = logits + self.cp_bias.to(logits.dtype)
+
+        biased_logits = logits + self.cp_bias.to(
+            device=logits.device,
+            dtype=logits.dtype,
+        )
         top_values, top_indices = torch.topk(biased_logits, k=self.top_k, dim=-1)
         top_weights = F.softmax(top_values, dim=-1)
 
