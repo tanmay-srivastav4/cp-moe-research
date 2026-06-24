@@ -49,7 +49,7 @@ training:
 
 data:
   mode: superni
-  data_dir: /kaggle/input/superni-tasks
+  data_dir: /kaggle/working/cp-moe-research/data/raw/superni
   eval_fraction: 0.1
   train_max_samples: null
   eval_max_samples: 200
