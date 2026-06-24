@@ -113,13 +113,15 @@ class MoELoraLinear(nn.Module):
         base_out = self.base(x)
         original_shape = x.shape
         flat_x = x.reshape(-1, original_shape[-1])
-        print(
-            "flat_x:", flat_x.device,
-            "router:", self.router.weight.device,
-            "lora_a:", self.lora_a.device,
-            "lora_b:", self.lora_b.device,
-            "cp_bias:", self.cp_bias.device,
-        )
+        if not hasattr(self, "_printed_debug"):
+            print(
+                "flat_x:", flat_x.device,
+                "router:", self.router.weight.device,
+                "lora_a:", self.lora_a.device,
+                "lora_b:", self.lora_b.device,
+                "cp_bias:", self.cp_bias.device,
+            )
+            self._printed_debug = True
         self._maybe_capture_input(flat_x)
 
         if self.transient_active:
@@ -127,22 +129,6 @@ class MoELoraLinear(nn.Module):
             self.last_aux_loss = None
             self.last_router_entropy = None
             return base_out + mixed
-
-        # Ensure all CP-MoE tensors are on the same device/dtype
-        device = flat_x.device
-        dtype = flat_x.dtype
-
-        if self.router.weight.device != device:
-            self.router = self.router.to(device=device, dtype=dtype)
-
-        if self.lora_a.device != device:
-            self.lora_a.data = self.lora_a.data.to(device=device, dtype=dtype)
-
-        if self.lora_b.device != device:
-            self.lora_b.data = self.lora_b.data.to(device=device, dtype=dtype)
-
-        if self.cp_bias.device != device:
-            self.cp_bias.data = self.cp_bias.data.to(device=device, dtype=dtype)
 
         dropped = self.dropout(flat_x)
 
@@ -285,6 +271,11 @@ def moe_auxiliary_loss(model: nn.Module, device: torch.device) -> torch.Tensor:
         for layer in collect_moe_layers(model)
         if layer.last_aux_loss is not None
     ]
+
     if not losses:
         return torch.zeros((), device=device)
+
+    target_device = losses[0].device
+    losses = [loss.to(target_device) for loss in losses]
+
     return torch.stack(losses).mean()
