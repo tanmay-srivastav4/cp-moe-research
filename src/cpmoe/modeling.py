@@ -8,7 +8,7 @@ from torch.nn import functional as F
 
 try:
     from transformers.pytorch_utils import Conv1D
-except ImportError:  # pragma: no cover - transformers is optional for syntax-only checks.
+except ImportError:
     Conv1D = ()  # type: ignore[assignment]
 
 
@@ -42,16 +42,22 @@ class MoELoraLinear(nn.Module):
         in_features, out_features = self._feature_dims(base)
         self.in_features = in_features
         self.out_features = out_features
+
+        # Keep all MoE params as plain Parameters (CPU at init).
+        # forward() moves them to flat_x.device on the fly, which correctly
+        # handles device_map="auto" multi-GPU splits.
         self.lora_a = nn.Parameter(torch.zeros(num_experts, rank, in_features))
         self.lora_b = nn.Parameter(torch.zeros(num_experts, out_features, rank))
-        self.router = nn.Linear(in_features, num_experts, bias=False)
+        self.router_weight = nn.Parameter(torch.zeros(num_experts, in_features))
+        # cp_bias is not a gradient parameter; it's set externally.
         self.cp_bias = nn.Parameter(torch.zeros(num_experts), requires_grad=False)
+
         self.register_parameter("transient_a", None)
         self.register_parameter("transient_b", None)
 
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
         nn.init.zeros_(self.lora_b)
-        nn.init.zeros_(self.router.weight)
+        nn.init.zeros_(self.router_weight)
 
         self.last_aux_loss: torch.Tensor | None = None
         self.last_router_entropy: torch.Tensor | None = None
@@ -64,8 +70,10 @@ class MoELoraLinear(nn.Module):
         if isinstance(base, nn.Linear):
             return base.in_features, base.out_features
         if Conv1D and isinstance(base, Conv1D):
-            # HF GPT-style Conv1D stores weight as [in_features, out_features].
             return int(base.weight.shape[0]), int(base.weight.shape[1])
+        # bitsandbytes / other quantized linears
+        if hasattr(base, "in_features") and hasattr(base, "out_features"):
+            return base.in_features, base.out_features
         raise TypeError(f"Unsupported base module for MoE-LoRA: {type(base).__name__}")
 
     @property
@@ -73,32 +81,12 @@ class MoELoraLinear(nn.Module):
         return self.transient_a is not None and self.transient_b is not None
 
     def start_transient_probe(self) -> None:
-        device = self.lora_a.device
-        dtype = self.lora_a.dtype
-
-        transient_a = nn.Parameter(
-            torch.zeros(
-                self.rank,
-                self.in_features,
-                device=device,
-                dtype=dtype,
-            )
-        )
-
-        transient_b = nn.Parameter(
-            torch.zeros(
-                self.out_features,
-                self.rank,
-                device=device,
-                dtype=dtype,
-            )
-        )
-
-        nn.init.kaiming_uniform_(transient_a, a=5**0.5)
-        nn.init.zeros_(transient_b)
-
-        self.transient_a = transient_a
-        self.transient_b = transient_b
+        ta = nn.Parameter(torch.zeros(self.rank, self.in_features))
+        tb = nn.Parameter(torch.zeros(self.out_features, self.rank))
+        nn.init.kaiming_uniform_(ta, a=5**0.5)
+        nn.init.zeros_(tb)
+        self.transient_a = ta
+        self.transient_b = tb
 
     def stop_transient_probe(self) -> None:
         self.register_parameter("transient_a", None)
@@ -109,39 +97,32 @@ class MoELoraLinear(nn.Module):
             return []
         return [self.transient_a, self.transient_b]
 
+    def _to_x(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Move tensor t to same device+dtype as x (handles multi-GPU splits)."""
+        return t.to(device=x.device, dtype=x.dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
         original_shape = x.shape
         flat_x = x.reshape(-1, original_shape[-1])
-        if not hasattr(self, "_printed_debug"):
-            print(
-                "flat_x:", flat_x.device,
-                "router:", self.router.weight.device,
-                "lora_a:", self.lora_a.device,
-                "lora_b:", self.lora_b.device,
-                "cp_bias:", self.cp_bias.device,
-            )
-            self._printed_debug = True
         self._maybe_capture_input(flat_x)
 
         if self.transient_active:
-            mixed = self.transient_output(flat_x).reshape(*original_shape[:-1], -1)
+            mixed = self._transient_output(flat_x).reshape(*original_shape[:-1], -1)
             self.last_aux_loss = None
             self.last_router_entropy = None
             return base_out + mixed
 
         dropped = self.dropout(flat_x)
 
-        logits = self.router(flat_x)
-
-        biased_logits = logits + self.cp_bias.to(
-            device=logits.device,
-            dtype=logits.dtype,
-        )
+        # Route: move router_weight to x's device inline (Eq. 3)
+        logits = F.linear(flat_x, self._to_x(self.router_weight, flat_x))
+        biased_logits = logits + self._to_x(self.cp_bias, flat_x)
         top_values, top_indices = torch.topk(biased_logits, k=self.top_k, dim=-1)
         top_weights = F.softmax(top_values, dim=-1)
 
-        expert_out = self.expert_outputs(dropped)
+        # Expert outputs (Eq. 4)
+        expert_out = self._expert_outputs(dropped)
         chosen = torch.gather(
             expert_out,
             1,
@@ -153,29 +134,22 @@ class MoELoraLinear(nn.Module):
         self._record_router_metrics(logits, top_indices)
         return base_out + mixed
 
-    def expert_outputs(self, flat_x: torch.Tensor) -> torch.Tensor:
-        lora_a = self.lora_a.to(device=flat_x.device, dtype=flat_x.dtype)
-        lora_b = self.lora_b.to(device=flat_x.device, dtype=flat_x.dtype)
-        expert_hidden = torch.einsum("bi,eri->ber", flat_x, lora_a)
-        return torch.einsum("ber,eor->beo", expert_hidden, lora_b) * self.scaling
+    def _expert_outputs(self, flat_x: torch.Tensor) -> torch.Tensor:
+        lora_a = self._to_x(self.lora_a, flat_x)
+        lora_b = self._to_x(self.lora_b, flat_x)
+        h = torch.einsum("bi,eri->ber", flat_x, lora_a)
+        return torch.einsum("ber,eor->beo", h, lora_b) * self.scaling
 
-    def transient_output(self, flat_x: torch.Tensor) -> torch.Tensor:
+    def _transient_output(self, flat_x: torch.Tensor) -> torch.Tensor:
         if not self.transient_active:
             raise RuntimeError("Transient probe is not active")
+        ta = self._to_x(self.transient_a, flat_x)
+        tb = self._to_x(self.transient_b, flat_x)
+        return torch.matmul(torch.matmul(flat_x, ta.t()), tb.t()) * self.scaling
 
-        transient_a = self.transient_a.to(
-            device=flat_x.device,
-            dtype=flat_x.dtype,
-        )
-
-        transient_b = self.transient_b.to(
-            device=flat_x.device,
-            dtype=flat_x.dtype,
-        )
-
-        hidden = torch.matmul(flat_x, transient_a.t())
-        return torch.matmul(hidden, transient_b.t()) * self.scaling
-
+    # ------------------------------------------------------------------ #
+    # Input capture for CKA                                                #
+    # ------------------------------------------------------------------ #
     def start_input_capture(self, max_tokens: int) -> None:
         self._capture_inputs = True
         self._capture_max_tokens = max_tokens
@@ -192,19 +166,23 @@ class MoELoraLinear(nn.Module):
     def _maybe_capture_input(self, flat_x: torch.Tensor) -> None:
         if not self._capture_inputs:
             return
-        already = sum(tensor.shape[0] for tensor in self._captured_inputs)
+        already = sum(t.shape[0] for t in self._captured_inputs)
         remaining = self._capture_max_tokens - already
         if remaining <= 0:
             return
-        self._captured_inputs.append(flat_x[:remaining].detach())
+        self._captured_inputs.append(flat_x[:remaining].detach().cpu())
 
-    def _record_router_metrics(self, logits: torch.Tensor, top_indices: torch.Tensor) -> None:
-        # Eq. 12: both f_i (load) and P_i (prob_mean) must use native logits only.
-        # top_indices here comes from biased logits (used for actual routing), so we
-        # recompute native top-k to get the correct f_i for the aux loss.
+    def _record_router_metrics(
+        self, logits: torch.Tensor, top_indices: torch.Tensor
+    ) -> None:
+        # Eq. 12: f_i and P_i both from native (un-biased) logits.
         probs = F.softmax(logits, dim=-1)
         native_top = torch.topk(logits, k=self.top_k, dim=-1).indices
-        load = F.one_hot(native_top, num_classes=self.num_experts).float().mean(dim=(0, 1))
+        load = (
+            F.one_hot(native_top, num_classes=self.num_experts)
+            .float()
+            .mean(dim=(0, 1))
+        )
         prob_mean = probs.mean(dim=0)
         self.last_aux_loss = self.num_experts * torch.sum(load * prob_mean)
         self.last_router_entropy = -(prob_mean * (prob_mean + 1e-8).log()).sum()
@@ -212,11 +190,15 @@ class MoELoraLinear(nn.Module):
     def set_cp_bias(self, scores: torch.Tensor, alpha: float) -> None:
         if scores.numel() != self.num_experts:
             raise ValueError("CP bias score count must match num_experts")
-        self.cp_bias.data.copy_(alpha * scores.to(self.cp_bias.device, self.cp_bias.dtype))
+        self.cp_bias.data.copy_(alpha * scores.float())
 
     def zero_cp_bias(self) -> None:
         self.cp_bias.data.zero_()
 
+
+# ------------------------------------------------------------------ #
+# Model-level helpers                                                   #
+# ------------------------------------------------------------------ #
 
 def replace_target_linears(
     model: nn.Module,
@@ -249,9 +231,10 @@ def replace_target_linears(
 
 
 def _is_supported_linear(module: nn.Module) -> bool:
-    if isinstance(module, nn.Linear) or bool(Conv1D and isinstance(module, Conv1D)):
+    if isinstance(module, nn.Linear):
         return True
-    # bitsandbytes quantized linear modules expose the same feature attributes.
+    if Conv1D and isinstance(module, Conv1D):
+        return True
     return hasattr(module, "in_features") and hasattr(module, "out_features")
 
 
@@ -262,7 +245,7 @@ def _iter_named_children_with_parent(module: nn.Module):
 
 
 def collect_moe_layers(model: nn.Module) -> list[MoELoraLinear]:
-    return [module for module in model.modules() if isinstance(module, MoELoraLinear)]
+    return [m for m in model.modules() if isinstance(m, MoELoraLinear)]
 
 
 def moe_auxiliary_loss(model: nn.Module, device: torch.device) -> torch.Tensor:
@@ -271,11 +254,6 @@ def moe_auxiliary_loss(model: nn.Module, device: torch.device) -> torch.Tensor:
         for layer in collect_moe_layers(model)
         if layer.last_aux_loss is not None
     ]
-
     if not losses:
         return torch.zeros((), device=device)
-
-    target_device = losses[0].device
-    losses = [loss.to(target_device) for loss in losses]
-
-    return torch.stack(losses).mean()
+    return torch.stack([l.to(device) for l in losses]).mean()

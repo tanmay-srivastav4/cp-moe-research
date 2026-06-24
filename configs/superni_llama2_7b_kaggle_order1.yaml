@@ -1,19 +1,19 @@
 experiment:
-  name: superni_llama2_7b_kaggle_order1
-  output_dir: outputs/superni_llama2_7b_kaggle_order1
+  name: superni_cpmoe_llama2_order1
+  output_dir: /kaggle/working/outputs/superni_llama2_order1
   seed: 7
 
 model:
   name_or_path: meta-llama/Llama-2-7b-hf
-  torch_dtype: float16
-  load_in_4bit: true
+  torch_dtype: bfloat16
+  load_in_4bit: false          # set true if OOM on single P100; costs ~1pt accuracy
   trust_remote_code: false
 
 cp_moe:
   num_experts: 8
   top_k: 2
   rank: 4
-  lora_alpha: 32
+  lora_alpha: 8
   lora_dropout: 0.1
   target_modules:
     - q_proj
@@ -35,19 +35,23 @@ transient:
 
 training:
   lr: 2.0e-4
-  batch_size: 1
-  gradient_accumulation_steps: 16
+  batch_size: 4
+  eval_batch_size: 4
+  gradient_accumulation_steps: 4   # effective batch = 16 as per paper
   epochs_per_task: 5
   max_seq_length: 512
-  save_after_each_task: false
-  evaluate_seen_after_each_task: true
-  eval_batch_size: 1
   max_new_tokens: 64
-  train_max_samples: null
+  train_max_samples: null           # use full task data
   eval_max_samples: 200
+  evaluate_seen_after_each_task: true
+  save_after_each_task: true
 
 data:
   mode: superni
+  data_dir: /kaggle/input/superni-tasks/tasks
+  eval_fraction: 0.1
+  train_max_samples: null
+  eval_max_samples: 200
   order:
     - task1572
     - task363
@@ -65,7 +69,3 @@ data:
     - task591
     - task084
     - task875
-  data_dir: data/raw/superni
-  eval_fraction: 0.1
-  train_max_samples: null
-  eval_max_samples: 200
