@@ -6,8 +6,9 @@ experiment:
 model:
   name_or_path: meta-llama/Llama-2-7b-hf
   torch_dtype: bfloat16
-  load_in_4bit: false          # set true if OOM on single P100; costs ~1pt accuracy
+  load_in_4bit: false
   trust_remote_code: false
+  device_map: "auto"
 
 cp_moe:
   num_experts: 8
@@ -37,18 +38,18 @@ training:
   lr: 2.0e-4
   batch_size: 4
   eval_batch_size: 4
-  gradient_accumulation_steps: 4   # effective batch = 16 as per paper
+  gradient_accumulation_steps: 4
   epochs_per_task: 5
   max_seq_length: 512
   max_new_tokens: 64
-  train_max_samples: null           # use full task data
+  train_max_samples: null
   eval_max_samples: 200
   evaluate_seen_after_each_task: true
   save_after_each_task: true
 
 data:
   mode: superni
-  data_dir: /kaggle/input/superni-tasks/tasks
+  data_dir: /kaggle/input/superni-tasks
   eval_fraction: 0.1
   train_max_samples: null
   eval_max_samples: 200
@@ -68,4 +69,3 @@ data:
     - task511
     - task591
     - task875
-  device_map: "auto"

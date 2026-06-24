@@ -8,6 +8,7 @@ model:
   torch_dtype: float32
   load_in_4bit: false
   trust_remote_code: false
+  device_map: "cuda:0"
 
 cp_moe:
   num_experts: 4
@@ -31,15 +32,15 @@ transient:
 training:
   lr: 2.0e-4
   batch_size: 2
+  eval_batch_size: 2
   gradient_accumulation_steps: 1
   epochs_per_task: 1
   max_seq_length: 128
-  save_after_each_task: false
-  evaluate_seen_after_each_task: true
-  eval_batch_size: 2
   max_new_tokens: 16
   train_max_samples: null
   eval_max_samples: null
+  evaluate_seen_after_each_task: true
+  save_after_each_task: false
 
 data:
   mode: toy
@@ -55,4 +56,4 @@ data:
         - input: "Question: What color is the sky? Answer:"
           output: " blue"
         - input: "Question: How many days are in a week? Answer:"
-          output: " seven"  device_map: "cuda:0"
+          output: " seven"
