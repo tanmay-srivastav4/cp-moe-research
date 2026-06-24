@@ -67,5 +67,5 @@ data:
     - task748
     - task511
     - task591
-    - task084
     - task875
+  device_map: "auto"

@@ -55,4 +55,4 @@ data:
         - input: "Question: What color is the sky? Answer:"
           output: " blue"
         - input: "Question: How many days are in a week? Answer:"
-          output: " seven"
+          output: " seven"  device_map: "cuda:0"

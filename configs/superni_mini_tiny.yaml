@@ -8,6 +8,7 @@ model:
   torch_dtype: float32
   load_in_4bit: false
   trust_remote_code: false
+  device_map: "cuda:0"
 
 cp_moe:
   num_experts: 4

@@ -20,6 +20,7 @@ class ModelConfig:
     torch_dtype: str = "float32"
     load_in_4bit: bool = False
     trust_remote_code: bool = False
+    device_map: str = "auto"
 
 
 @dataclass
