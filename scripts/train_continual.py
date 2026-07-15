@@ -77,6 +77,7 @@ def main() -> None:
             device_map=config.model.device_map,
             trust_remote_code=config.model.trust_remote_code,
             token=hf_token,
+            attn_implementation="flash_attention_2",
         )
     else:
         print(f"Loading in {config.model.torch_dtype} with device_map=auto...")
@@ -86,6 +87,7 @@ def main() -> None:
             device_map=config.model.device_map,
             trust_remote_code=config.model.trust_remote_code,
             token=hf_token,
+            attn_implementation="flash_attention_2",
         )
 
     for param in model.parameters():
