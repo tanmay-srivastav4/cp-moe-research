@@ -21,6 +21,7 @@ class ModelConfig:
     load_in_4bit: bool = False
     trust_remote_code: bool = False
     device_map: str = "auto"
+    attn_implementation: str = "sdpa"
 
 
 @dataclass
