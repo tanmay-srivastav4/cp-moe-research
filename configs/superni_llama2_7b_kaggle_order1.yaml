@@ -9,6 +9,7 @@ model:
   load_in_4bit: true
   trust_remote_code: false
   device_map: "auto"
+  attn_implementation: sdpa
 
 cp_moe:
   num_experts: 8
