@@ -173,7 +173,7 @@ def main() -> None:
                 task_loss = model(**batch).loss
                 aux_loss = moe_auxiliary_loss(model, device)
                 # reg_loss computed on CPU (lora params are CPU tensors)
-                reg_loss = expert_regularization(layers, old_experts, importance)
+                reg_loss = expert_regularization(layers, old_experts, importance, device=device)
 
                 total_loss = (
                     task_loss

@@ -81,8 +81,9 @@ class MoELoraLinear(nn.Module):
         return self.transient_a is not None and self.transient_b is not None
 
     def start_transient_probe(self) -> None:
-        ta = nn.Parameter(torch.zeros(self.rank, self.in_features))
-        tb = nn.Parameter(torch.zeros(self.out_features, self.rank))
+        device = self.lora_a.device
+        ta = nn.Parameter(torch.zeros(self.rank, self.in_features, device=device))
+        tb = nn.Parameter(torch.zeros(self.out_features, self.rank, device=device))
         nn.init.kaiming_uniform_(ta, a=5**0.5)
         nn.init.zeros_(tb)
         self.transient_a = ta
@@ -223,6 +224,8 @@ def replace_target_linears(
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
         )
+        target_device = next(child.parameters()).device
+        moe = moe.to(target_device)
         setattr(parent, child_name, moe)
         wrapped.append(moe)
     if not wrapped:

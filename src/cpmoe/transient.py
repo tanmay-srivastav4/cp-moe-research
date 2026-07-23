@@ -22,24 +22,29 @@ def reset_cp_biases(layers: list[MoELoraLinear]) -> None:
         layer.zero_cp_bias()
 
 
-@torch.no_grad()
 def expert_regularization(
     layers: list[MoELoraLinear],
     snapshots: list[dict[str, torch.Tensor]],
     importance: list[dict[str, torch.Tensor]],
+    device: torch.device,
 ) -> torch.Tensor:
     if not layers:
         raise ValueError("No MoE layers passed to expert_regularization")
     # Use the first non-zero loss device; fall back to CPU.
     # The actual tensors are moved inside the loop so device_map splits are safe.
-    total = torch.zeros((), device="cpu")
+    total = torch.zeros((), device=device)
     for layer, old, omega in zip(layers, snapshots, importance, strict=True):
         # lora_a/lora_b live on CPU (Parameters), compute on CPU to avoid
         # cross-device ops; the backward graph stays correct.
-        diff_a = (layer.lora_a.cpu() - old["a"].cpu()).pow(2)
-        diff_b = (layer.lora_b.cpu() - old["b"].cpu()).pow(2)
-        total = total + (omega["a"].cpu() * diff_a).sum()
-        total = total + (omega["b"].cpu() * diff_b).sum()
+        layer_device = layer.lora_a.device
+        old_a = old["a"].to(layer_device)
+        old_b = old["b"].to(layer_device)
+        omega_a = omega["a"].to(layer_device)
+        omega_b = omega["b"].to(layer_device)
+        diff_a = (layer.lora_a - old_a).pow(2)
+        diff_b = (layer.lora_b - old_b).pow(2)
+        term = (omega_a * diff_a).sum() + (omega_b * diff_b).sum()
+        total = total + term.to(device)
     return total
 
 
@@ -47,8 +52,8 @@ def expert_regularization(
 def snapshot_experts(layers: list[MoELoraLinear]) -> list[dict[str, torch.Tensor]]:
     return [
         {
-            "a": layer.lora_a.detach().clone().cpu(),
-            "b": layer.lora_b.detach().clone().cpu(),
+            "a": layer.lora_a.detach().clone(),
+            "b": layer.lora_b.detach().clone(),
         }
         for layer in layers
     ]
@@ -58,8 +63,8 @@ def snapshot_experts(layers: list[MoELoraLinear]) -> list[dict[str, torch.Tensor
 def zero_importance(layers: list[MoELoraLinear]) -> list[dict[str, torch.Tensor]]:
     return [
         {
-            "a": torch.zeros_like(layer.lora_a, device="cpu"),
-            "b": torch.zeros_like(layer.lora_b, device="cpu"),
+            "a": torch.zeros_like(layer.lora_a),
+            "b": torch.zeros_like(layer.lora_b),
         }
         for layer in layers
     ]
@@ -271,9 +276,12 @@ def _apply_probe_results(
         layers, importance, transient_importance, cka_scores, strict=True
     ):
         layer.set_cp_bias(scores, cp_bias_alpha)
-        scores_cpu = scores.cpu().float()
-        total["a"].add_(scores_cpu.view(-1, 1, 1) * omega["a"].unsqueeze(0))
-        total["b"].add_(scores_cpu.view(-1, 1, 1) * omega["b"].unsqueeze(0))
+        target = total["a"].device
+        scores_t = scores.to(target).float()
+        omega_a = omega["a"].to(target)
+        omega_b = omega["b"].to(target)
+        total["a"].add_(scores_t.view(-1, 1, 1) * omega_a.unsqueeze(0))
+        total["b"].add_(scores_t.view(-1, 1, 1) * omega_b.unsqueeze(0))
 
 
 @torch.no_grad()
