@@ -93,6 +93,10 @@ def main() -> None:
     for param in model.parameters():
         param.requires_grad = False
 
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False  
+
+
     # ── Inject MoE-LoRA ────────────────────────────────────────────────────
     layers = replace_target_linears(
         model,
