@@ -37,11 +37,11 @@ transient:
 
 training:
   lr: 2.0e-4
-  batch_size: 2
-  eval_batch_size: 2
-  gradient_accumulation_steps: 4
+  batch_size: 1
+  eval_batch_size: 1
+  gradient_accumulation_steps: 8
   epochs_per_task: 1
-  max_seq_length: 256
+  max_seq_length: 192
   max_new_tokens: 64
   train_max_samples: 500
   eval_max_samples: 25
