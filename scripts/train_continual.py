@@ -74,7 +74,7 @@ def main() -> None:
         model = AutoModelForCausalLM.from_pretrained(
             config.model.name_or_path,
             quantization_config=bnb_cfg,
-            device_map="auto",
+            device_map=config.model.device_map,
             max_memory={0: "13GiB", 1: "12GiB"},
             trust_remote_code=config.model.trust_remote_code,
             token=hf_token,
@@ -85,7 +85,7 @@ def main() -> None:
         model = AutoModelForCausalLM.from_pretrained(
             config.model.name_or_path,
             torch_dtype=resolve_dtype(config.model.torch_dtype),
-            device_map="auto",
+            device_map=config.model.device_map,
             max_memory={0: "13GiB", 1: "12GiB"},
             trust_remote_code=config.model.trust_remote_code,
             token=hf_token,
